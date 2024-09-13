@@ -1,0 +1,303 @@
+Parameters:
+  VPCCIDRRange:
+    Description: The CIDR range of the VPC
+    Default: 10.11.0.0/24
+    Type: String
+  FactorioVersion:
+    Description: The target version of Factorio
+    Default: 1.1.110
+    Type: String
+  ServerName:
+    Description: The name of the server
+    Default: Factorio Dedicated Server
+    Type: String
+  ServerPassword:
+    Description: The password for the server
+    Default: f4ct0r10
+    Type: String
+  LatestAmiId:
+    Description: AMI for EC2
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VPCCIDRRange
+      Tags:
+        - Key: Name
+          Value: Factorio Headless Server VPC   
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [ '0', !Cidr [ !GetAtt VPC.CidrBlock, "2", "5" ]]
+      AvailabilityZone: !Select [0, !GetAZs ''] # '' means the current region
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: Factorio Headless Server Subnet   
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: 
+        - Key: Name
+          Value: Factorio Headless Server IGW
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags: 
+        - Key: Name
+          Value: Factorio Headless Server RT
+  InternetRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref RouteTable
+  RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref Subnet
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable UDP and SSH trafic to the factorio server
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - Description: Allow SSH IPv4 IN
+          IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - Description: Allow UDP IN in port 34197
+          IpProtocol: udp
+          FromPort: 34197
+          ToPort: 34197
+          CidrIp: 0.0.0.0/0    
+      SecurityGroupEgress:
+        - Description: Allow TCP IPv4 OUT (for updates and downloads)
+          IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+        - Description: Allow ping traffic out 
+          IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: Factorio Headless Server SG    
+  EBSVolume:
+    Type: AWS::EC2::Volume
+    Properties:
+      AvailabilityZone: !GetAtt Subnet.AvailabilityZone
+      VolumeType: gp3
+      Size: 10
+      Tags:
+        - Key: Name
+          Value: Factorio Headless Server Storage
+  EBSVolumeMount:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      Device: /dev/xvdf
+      InstanceId: !Ref Instance
+      VolumeId: !Ref EBSVolume
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      ImageId: !Ref LatestAmiId      
+      SubnetId: !Ref Subnet
+      SecurityGroupIds: 
+        - !Ref InstanceSecurityGroup
+      Tags:
+        - Key: Name
+          Value: Factorio Headless Server
+      UserData: #This is failing for some reason
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          yum -y update
+          yum -y upgrade
+          
+          #Create the file system for the EBS volume and mount it
+          mkfs -t xfs /dev/xvdf
+          mkdir /ebs
+          mount /dev/xvdf /ebs
+          blkid -s UUID -o value /dev/xvdf | xargs -I {} sudo sh -c "echo 'UUID={}  /ebs  xfs  defaults,nofail  0  2' >> /etc/fstab"
+
+          #Get the Factorio headless server
+          wget -O /tmp/factorio_headless.tar.xz https://factorio.com/get-download/${FactorioVersion}/headless/linux64
+          
+          # Unzip the .xz file into /ebs/factorio
+          cd /ebs
+          tar -xJf /tmp/factorio_headless.tar.xz
+
+          useradd factorio
+          chown -R factorio:factorio /ebs/factorio
+
+          #Create a new savegame
+          SAVEGAME_PATH="/ebs/savegames/savegame.zip"
+          /ebs/factorio/bin/x64/factorio --create "$SAVEGAME_PATH"
+
+
+          #Create a server settings file
+          SERVER_SETTINGS_FILE_PATH="/ebs/server-settings.json"
+          cat <<EOF > "$SERVER_SETTINGS_FILE_PATH"
+          {
+              "name": "${ServerName}",
+              "description": "",
+              "visibility": {
+                  "public": false,
+                  "lan": false
+              },
+              "max_players": 10,
+              "game_password": "${ServerPassword}",
+              "require_user_verification": true,
+              "auto_pause": true
+          }
+          EOF
+
+          #Add script to run server on instance reboot
+          SERVER_START_COMMAND="/ebs/factorio/bin/x64/factorio --start-server $SAVEGAME_PATH --server-settings $SERVER_SETTINGS_FILE_PATH"
+
+          cat <<EOF > "/var/lib/cloud/scripts/per-boot/restart-server.sh"
+          #!/bin/bash -xe
+          su factorio
+          $SERVER_START_COMMAND
+          EOF
+
+          chmod +x /var/lib/cloud/scripts/per-boot/restart-server.sh
+
+          #Start the server 
+          su factorio
+          $SERVER_START_COMMAND &
+  ElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref Instance
+    DependsOn: IGWAttachment
+  CloudWatchAlarm:
+    Type: "AWS::CloudWatch::Alarm"
+    Properties:
+      AlarmName: stop-server-when-empty
+      AlarmDescription: Stop the server when CPU utilization is below 2% for 30 minutes
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref Instance
+      Statistic: Average
+      Period: 300  # Check every 5 minutes (300 seconds)
+      EvaluationPeriods: 6  # 6 periods of 5 minutes = 30 minutes
+      Threshold: 3.0  # Alarm threshold at 2%
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Sub arn:aws:automate:${AWS::Region}:ec2:stop 
+      InsufficientDataActions: []
+      OKActions: []
+  InstanceIdSSMParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /factorio/ec2-instance-id
+      Type: String
+      Value: !Ref Instance
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "factorio-server-lambda-execution-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: allow-ec2-start-factorio-server
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ec2:Start*
+                Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${Instance}"
+        - PolicyName: allow-ssm-instance-id-parameter
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${InstanceIdSSMParameter}"
+        - PolicyName: allow-cloudwatch
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "factorio-lambda-start-server"
+      Handler: "index.lambda_handler"
+      Code: 
+        ZipFile:
+          Fn::Sub: |
+            import boto3
+
+            def lambda_handler(event, context):
+                ssm_client = boto3.client("ssm")
+                ec2_client = boto3.client("ec2", region_name="${AWS::Region}")
+                
+                print("Starting Factorio Server")
+                instance_id = ssm_client.get_parameter(Name="${InstanceIdSSMParameter}")["Parameter"]["Value"]
+                ec2_client.start_instances(InstanceIds=[instance_id])
+
+                return {
+                    "statusCode": 200,
+                    "headers": {"Content-Type": "application/json"},
+                    "body": {"status": "ok"}
+                }
+      Runtime: python3.12
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+  LambdaUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunctionUrl
+      FunctionName: !GetAtt LambdaFunction.Arn
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+  LambdaUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: NONE
+      TargetFunctionArn: !GetAtt LambdaFunction.Arn
+Outputs:
+  ServerIP:
+    Description: The IP of the factorio server
+    Value: !GetAtt ElasticIP.PublicIp
+  ServerPort:
+    Description: The port used to connect to the server
+    Value: 34197
+  ServerPassword:
+    Description: The password for the server
+    Value: !Ref ServerPassword
+  StartServerCommand:
+    Description: The command used to remotely start the server.
+    Value: !Sub curl -X POST ${LambdaUrl.FunctionUrl}
