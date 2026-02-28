@@ -18,7 +18,7 @@ Parameters:
   LatestAmiId:
     Description: AMI for EC2
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
-    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
 Resources:
   VPC:
     Type: AWS::EC2::VPC
@@ -114,7 +114,7 @@ Resources:
   Instance:
     Type: AWS::EC2::Instance
     Properties:
-      InstanceType: t2.micro
+      InstanceType: t3.small
       ImageId: !Ref LatestAmiId      
       SubnetId: !Ref Subnet
       SecurityGroupIds: 
@@ -122,34 +122,40 @@ Resources:
       Tags:
         - Key: Name
           Value: Factorio Headless Server
-      UserData: #This is failing for some reason
+      UserData:
         Fn::Base64: !Sub |
           #!/bin/bash -xe
-          yum -y update
-          yum -y upgrade
+          dnf -y update
           
-          #Create the file system for the EBS volume and mount it
-          mkfs -t xfs /dev/xvdf
-          mkdir /ebs
+          # 1. Mount EBS Volume safely
+          while [ ! -b /dev/xvdf ]; do sleep 1; done
+          # Only format if no filesystem exists
+          blkid /dev/xvdf || mkfs -t xfs /dev/xvdf
+          
+          mkdir -p /ebs
           mount /dev/xvdf /ebs
-          blkid -s UUID -o value /dev/xvdf | xargs -I {} sudo sh -c "echo 'UUID={}  /ebs  xfs  defaults,nofail  0  2' >> /etc/fstab"
-
-          #Get the Factorio headless server
-          wget -O /tmp/factorio_headless.tar.xz https://factorio.com/get-download/${FactorioVersion}/headless/linux64
           
-          # Unzip the .xz file into /ebs/factorio
-          cd /ebs
-          tar -xJf /tmp/factorio_headless.tar.xz
+          # Add to fstab if not already there
+          UUID=$(blkid -s UUID -o value /dev/xvdf)
+          grep -q "$UUID" /etc/fstab || echo "UUID=$UUID  /ebs  xfs  defaults,nofail  0  2" >> /etc/fstab
 
-          useradd factorio
-          chown -R factorio:factorio /ebs/factorio
+          # 2. Install Factorio (if not present)
+          if [ ! -d "/ebs/factorio" ]; then
+            wget -O /tmp/factorio_headless.tar.xz https://factorio.com/get-download/${FactorioVersion}/headless/linux64
+            tar -xJf /tmp/factorio_headless.tar.xz -C /ebs
+          fi
 
-          #Create a new savegame
+          # 3. Setup User & Permissions
+          id -u factorio &>/dev/null || useradd factorio
+          mkdir -p /ebs/savegames
+          
+          # 4. Create Save
           SAVEGAME_PATH="/ebs/savegames/savegame.zip"
-          /ebs/factorio/bin/x64/factorio --create "$SAVEGAME_PATH"
+          if [ ! -f "$SAVEGAME_PATH" ]; then
+            /ebs/factorio/bin/x64/factorio --create "$SAVEGAME_PATH"
+          fi
 
-
-          #Create a server settings file
+          # 5. Server Settings
           SERVER_SETTINGS_FILE_PATH="/ebs/server-settings.json"
           cat <<EOF > "$SERVER_SETTINGS_FILE_PATH"
           {
@@ -165,21 +171,27 @@ Resources:
               "auto_pause": true
           }
           EOF
+          chown -R factorio:factorio /ebs/factorio /ebs/savegames "$SERVER_SETTINGS_FILE_PATH"
 
-          #Add script to run server on instance reboot
-          SERVER_START_COMMAND="/ebs/factorio/bin/x64/factorio --start-server $SAVEGAME_PATH --server-settings $SERVER_SETTINGS_FILE_PATH"
+          # 6. Create Systemd Service
+          cat <<EOF > /etc/systemd/system/factorio.service
+          [Unit]
+          Description=Factorio Headless Server
+          After=network.target
 
-          cat <<EOF > "/var/lib/cloud/scripts/per-boot/restart-server.sh"
-          #!/bin/bash -xe
-          su factorio
-          $SERVER_START_COMMAND
+          [Service]
+          Type=simple
+          User=factorio
+          ExecStart=/ebs/factorio/bin/x64/factorio --start-server $SAVEGAME_PATH --server-settings $SERVER_SETTINGS_FILE_PATH
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
           EOF
 
-          chmod +x /var/lib/cloud/scripts/per-boot/restart-server.sh
-
-          #Start the server 
-          su factorio
-          $SERVER_START_COMMAND &
+          systemctl daemon-reload
+          systemctl enable factorio
+          systemctl start factorio
   ElasticIP:
     Type: AWS::EC2::EIP
     Properties:
