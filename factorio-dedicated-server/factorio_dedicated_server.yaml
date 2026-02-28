@@ -5,7 +5,7 @@ Parameters:
     Type: String
   FactorioVersion:
     Description: The target version of Factorio
-    Default: 1.1.110
+    Default: 2.0.73
     Type: String
   ServerName:
     Description: The name of the server
