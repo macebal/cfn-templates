@@ -19,6 +19,10 @@ Parameters:
     Description: AMI for EC2
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
     Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  InstanceType:
+    Description: EC2 instance type for the Factorio server
+    Type: String
+    Default: t3.small
   KeyPairName:
     Description: The name of an existing EC2 Key Pair to enable SSH access.
     Type: AWS::EC2::KeyPair::KeyName
@@ -122,7 +126,7 @@ Resources:
   Instance:
     Type: AWS::EC2::Instance
     Properties:
-      InstanceType: t3.small
+      InstanceType: !Ref InstanceType
       ImageId: !Ref LatestAmiId
       KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref "AWS::NoValue"]
       SubnetId: !Ref Subnet
