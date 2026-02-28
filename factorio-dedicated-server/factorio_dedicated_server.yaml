@@ -19,6 +19,14 @@ Parameters:
     Description: AMI for EC2
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
     Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  KeyPairName:
+    Description: The name of an existing EC2 Key Pair to enable SSH access.
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: ""
+
+Conditions:
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, ""]]
+
 Resources:
   VPC:
     Type: AWS::EC2::VPC
@@ -115,7 +123,8 @@ Resources:
     Type: AWS::EC2::Instance
     Properties:
       InstanceType: t3.small
-      ImageId: !Ref LatestAmiId      
+      ImageId: !Ref LatestAmiId
+      KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref "AWS::NoValue"]
       SubnetId: !Ref Subnet
       SecurityGroupIds: 
         - !Ref InstanceSecurityGroup
