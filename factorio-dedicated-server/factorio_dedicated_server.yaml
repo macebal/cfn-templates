@@ -123,6 +123,26 @@ Resources:
       Device: /dev/xvdf
       InstanceId: !Ref Instance
       VolumeId: !Ref EBSVolume
+  FactorioInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+
+  FactorioInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref FactorioInstanceRole
   Instance:
     Type: AWS::EC2::Instance
     Properties:
@@ -135,6 +155,7 @@ Resources:
       Tags:
         - Key: Name
           Value: Factorio Headless Server
+      IamInstanceProfile: !Ref FactorioInstanceProfile
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash -xe
@@ -205,6 +226,31 @@ Resources:
           systemctl daemon-reload
           systemctl enable factorio
           systemctl start factorio
+
+          # 7. Install the CloudWatch Agent
+          dnf install -y amazon-cloudwatch-agent
+
+          # 8. Create the configuration file
+          cat << 'EOF' > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+          {
+            "metrics": {
+              "append_dimensions": {
+                "InstanceId": "${!aws:InstanceId}"
+              },
+              "metrics_collected": {
+                "mem": {
+                  "measurement": [
+                    "mem_used_percent"
+                  ],
+                  "metrics_collection_interval": 60
+                }
+              }
+            }
+          }
+          EOF
+
+          # 9. Start the agent
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
   ElasticIP:
     Type: AWS::EC2::EIP
     Properties:
